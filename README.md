@@ -16,6 +16,20 @@ For an OpenAI-compatible inference API server, see [Irodori-TTS-Server](https://
 
 For model weights and audio samples, please refer to the [Irodori-TTS-v4-Small model card](https://huggingface.co/Aratako/Irodori-TTS-v4-Small).
 
+> [!NOTE]
+> **Experimental fp16 support.** This fork adds an optional `fp16` inference
+> precision for CUDA/XPU devices. It is intended for local experimentation,
+> especially on GPUs where fp16 is preferable to bf16 (for example, Pascal-era
+> cards without native bf16 support).
+>
+> The upstream project does not enable this option by default. fp16 may differ
+> in performance, numerical stability, and audio quality. If you encounter
+> issues, fall back to `fp32` or `bf16`.
+>
+> This patch updates the runtime precision handling and the dynamic precision
+> choices in the Gradio UIs. The `infer.py` CLI still exposes only `fp32` and
+> `bf16`.
+
 ## Features
 
 - **Flow Matching TTS**: Rectified Flow Diffusion Transformer (RF-DiT) over continuous DACVAE latents
