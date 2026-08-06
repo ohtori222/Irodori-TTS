@@ -4,7 +4,9 @@ import gc
 import hashlib
 import json
 import math
+import os
 import secrets
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -374,6 +376,80 @@ _INFERENCE_INT_CONFIG_KEYS = {
 _INFERENCE_FLOAT_CONFIG_KEYS = {"ref_max_seconds"}
 _INFERENCE_CONFIG_KEYS = _INFERENCE_INT_CONFIG_KEYS | _INFERENCE_FLOAT_CONFIG_KEYS
 _LEGACY_MAX_REF_SECONDS = 30.0
+_REFERENCE_LATENT_CACHE_VERSION = 1
+_REFERENCE_LATENT_CACHE_ENV = "IRODORI_REFERENCE_LATENT_CACHE_DIR"
+_REFERENCE_LATENT_LOCKS: dict[str, threading.Lock] = {}
+_REFERENCE_LATENT_LOCKS_GUARD = threading.Lock()
+
+
+def _reference_latent_cache_dir() -> Path:
+    configured = os.getenv(_REFERENCE_LATENT_CACHE_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path(".cache") / "irodori_reference_latents"
+
+
+def _reference_file_digest(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _reference_latent_lock(cache_key: str) -> threading.Lock:
+    with _REFERENCE_LATENT_LOCKS_GUARD:
+        return _REFERENCE_LATENT_LOCKS.setdefault(cache_key, threading.Lock())
+
+
+def _validate_reference_latent(
+    latent: object,
+    *,
+    latent_dim: int,
+    source: str,
+) -> torch.Tensor:
+    if not isinstance(latent, torch.Tensor):
+        raise ValueError(f"Reference latent must be a tensor: {source}")
+    if not latent.is_floating_point():
+        raise ValueError(f"Reference latent must use a floating-point dtype: {source}")
+    latent = _coerce_latent_shape(latent, latent_dim=latent_dim)
+    if latent.numel() == 0 or latent.shape[0] <= 0:
+        raise ValueError(f"Reference latent is empty: {source}")
+    if not bool(torch.isfinite(latent).all()):
+        raise ValueError(f"Reference latent contains non-finite values: {source}")
+    return latent.detach().to(device="cpu", dtype=torch.float32).contiguous()
+
+
+def _load_reference_latent_cache(
+    path: Path,
+    *,
+    latent_dim: int,
+) -> torch.Tensor | None:
+    if not path.is_file():
+        return None
+    try:
+        latent = torch.load(path, map_location="cpu", weights_only=True)
+        return _validate_reference_latent(latent, latent_dim=latent_dim, source=str(path))
+    except Exception:
+        return None
+
+
+def _save_reference_latent_atomic(path: Path, latent: torch.Tensor) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+        torch.save(latent, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _load_checkpoint_from_pt(
@@ -837,6 +913,30 @@ class InferenceRuntime:
         self.model.eval()
         return nullcontext()
 
+    def _reference_latent_cache_path(
+        self,
+        path: str,
+        *,
+        req: SamplingRequest,
+        max_ref_seconds: float,
+    ) -> tuple[Path, str]:
+        reference_digest = _reference_file_digest(path)
+        cache_identity = {
+            "version": _REFERENCE_LATENT_CACHE_VERSION,
+            "reference_sha256": reference_digest,
+            "codec_repo": str(self.key.codec_repo),
+            "codec_precision": str(self.key.codec_precision),
+            "codec_deterministic_encode": bool(self.key.codec_deterministic_encode),
+            "normalize_db": req.ref_normalize_db,
+            "ensure_max": bool(req.ref_ensure_max),
+            "max_ref_seconds": max_ref_seconds,
+            "latent_dim": int(self.model_cfg.latent_dim),
+        }
+        serialized = json.dumps(cache_identity, sort_keys=True, separators=(",", ":"))
+        cache_key = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        cache_path = _reference_latent_cache_dir() / f"{cache_key}.pt"
+        return cache_path, reference_digest
+
     def _load_reference_latent(
         self,
         *,
@@ -927,6 +1027,7 @@ class InferenceRuntime:
                     f"in input order ({ref_latent.shape[1]} steps before max-length trimming)."
                 )
         else:
+            messages.append("[tts] reference mode: latent")
             if req.ref_normalize_db is not None:
                 messages.append(
                     f"info: reference loudness normalize enabled per clip (target_db={float(req.ref_normalize_db):.2f}, includes peak safety scaling)."
@@ -937,24 +1038,56 @@ class InferenceRuntime:
                 )
             latent_pieces = []
             for path in wav_paths:
-                wav, sr = _load_audio(path)
-                if len(wav_paths) == 1 and max_ref_seconds > 0:
-                    max_ref_samples = max(1, int(max_ref_seconds * float(sr)))
-                    if wav.shape[1] > max_ref_samples:
+                cache_path, reference_digest = self._reference_latent_cache_path(
+                    path,
+                    req=req,
+                    max_ref_seconds=max_ref_seconds,
+                )
+                started = time.perf_counter()
+                with _reference_latent_lock(str(cache_path)):
+                    piece = _load_reference_latent_cache(
+                        cache_path,
+                        latent_dim=int(self.model_cfg.latent_dim),
+                    )
+                    if piece is not None:
                         messages.append(
-                            f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
-                            f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
+                            f"[ref-latent] cache hit: reference={reference_digest[:12]} "
+                            f"shape={tuple(piece.shape)} elapsed={time.perf_counter() - started:.3f}s"
                         )
-                        wav = wav[:, :max_ref_samples]
-                piece = self.codec.encode_waveform(
-                    wav.unsqueeze(0),
-                    sample_rate=int(sr),
-                    normalize_db=req.ref_normalize_db,
-                    ensure_max=bool(req.ref_ensure_max),
-                ).cpu()
-                if piece.shape[1] == 0:
-                    raise ValueError(f"Reference waveform produced an empty latent: {path}")
-                latent_pieces.append(piece)
+                    else:
+                        messages.append(
+                            f"[ref-latent] cache miss: reference={reference_digest[:12]}"
+                        )
+                        messages.append(
+                            f"[ref-latent] encoding on {self.codec_device}/{self.key.codec_precision}"
+                        )
+                        wav, sr = _load_audio(path)
+                        if len(wav_paths) == 1 and max_ref_seconds > 0:
+                            max_ref_samples = max(1, int(max_ref_seconds * float(sr)))
+                            if wav.shape[1] > max_ref_samples:
+                                messages.append(
+                                    f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
+                                    f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to "
+                                    f"{float(max_ref_samples) / float(sr):.2f}s."
+                                )
+                                wav = wav[:, :max_ref_samples]
+                        encoded = self.codec.encode_waveform(
+                            wav.unsqueeze(0),
+                            sample_rate=int(sr),
+                            normalize_db=req.ref_normalize_db,
+                            ensure_max=bool(req.ref_ensure_max),
+                        )
+                        piece = _validate_reference_latent(
+                            encoded,
+                            latent_dim=int(self.model_cfg.latent_dim),
+                            source=path,
+                        )
+                        _save_reference_latent_atomic(cache_path, piece)
+                        messages.append(
+                            f"[ref-latent] saved: {cache_path.name} shape={tuple(piece.shape)} "
+                            f"elapsed={time.perf_counter() - started:.3f}s"
+                        )
+                latent_pieces.append(piece.unsqueeze(0))
                 if (
                     max_ref_latent_steps is not None
                     and sum(int(item.shape[1]) for item in latent_pieces)
@@ -964,7 +1097,7 @@ class InferenceRuntime:
             ref_latent = torch.cat(latent_pieces, dim=1)
             if len(wav_paths) > 1:
                 messages.append(
-                    f"info: encoded and concatenated {len(latent_pieces)}/{len(wav_paths)} "
+                    f"info: resolved and concatenated {len(latent_pieces)}/{len(wav_paths)} "
                     "reference waveforms in input order "
                     f"({ref_latent.shape[1]} latent steps before max-length trimming)."
                 )
@@ -1067,6 +1200,8 @@ class InferenceRuntime:
                 req.decode_mode,
             )
         )
+        _log(f"[tts] model: {self.key.model_device}/{self.key.model_precision}")
+        _log(f"[tts] codec: {self.key.codec_device}/{self.key.codec_precision}")
 
         manual_seconds = None if req.seconds is None else float(req.seconds)
         if manual_seconds is not None and manual_seconds <= 0:
