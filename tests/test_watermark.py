@@ -1,7 +1,8 @@
 import os
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
+from irodori_tts.inference_runtime import _watermark_unavailable_message
 from irodori_tts.watermark import SilentCipherWatermarker
 
 
@@ -49,46 +50,24 @@ class TestSilentCipherWatermarkerEnvVar(unittest.TestCase):
 
 
 class TestWatermarkRuntimeLogMessages(unittest.TestCase):
-    """Regression tests for watermark log messages emitted by InferenceRuntime.
+    """Regression tests for the runtime's _watermark_unavailable_message helper.
 
-    These tests exercise the log-branching logic without constructing a full
-    InferenceRuntime — we only need a watermarker mock with ``ready`` and
-    ``disabled`` attributes and a minimal code path that mirrors the runtime's
-    watermark section.
+    These call the real production helper from inference_runtime to ensure the
+    disabled vs unavailable distinction is maintained.
     """
 
-    @staticmethod
-    def _watermark_log_message(*, ready: bool, disabled: bool) -> str:
-        """Replicate the runtime's watermark log-branching logic."""
-        if ready:
-            return ""
-        if disabled:
-            return (
-                "info: SilentCipher watermark is disabled by "
-                "IRODORI_DISABLE_WATERMARK; generated audio was not watermarked."
-            )
-        return (
-            "warning: SilentCipher watermark is unavailable; generated audio was not "
-            "watermarked."
-        )
-
     def test_disabled_shows_disabled_message(self):
-        msg = self._watermark_log_message(ready=False, disabled=True)
+        msg = _watermark_unavailable_message(disabled=True)
         self.assertIn("disabled by IRODORI_DISABLE_WATERMARK", msg)
-        self.assertNotIn("unavailable", msg)
 
     def test_disabled_does_not_show_unavailable(self):
-        msg = self._watermark_log_message(ready=False, disabled=True)
+        msg = _watermark_unavailable_message(disabled=True)
         self.assertNotIn("watermark is unavailable", msg)
 
     def test_unavailable_shows_warning(self):
-        msg = self._watermark_log_message(ready=False, disabled=False)
+        msg = _watermark_unavailable_message(disabled=False)
         self.assertIn("watermark is unavailable", msg)
         self.assertTrue(msg.startswith("warning:"))
-
-    def test_ready_emits_no_message(self):
-        msg = self._watermark_log_message(ready=True, disabled=False)
-        self.assertEqual(msg, "")
 
 
 if __name__ == "__main__":

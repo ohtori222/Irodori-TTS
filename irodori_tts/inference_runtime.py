@@ -40,6 +40,18 @@ from .tokenizer import PretrainedTextTokenizer
 from .watermark import SilentCipherWatermarker
 
 
+def _watermark_unavailable_message(*, disabled: bool) -> str:
+    if disabled:
+        return (
+            "info: SilentCipher watermark is disabled by "
+            "IRODORI_DISABLE_WATERMARK; generated audio was not watermarked."
+        )
+    return (
+        "warning: SilentCipher watermark is unavailable; generated audio was not "
+        "watermarked."
+    )
+
+
 def _is_mps_available() -> bool:
     backends = getattr(torch, "backends", None)
     if backends is None or not hasattr(backends, "mps"):
@@ -1579,16 +1591,7 @@ class InferenceRuntime:
                 stage_timings.append(("silentcipher_watermark", stage_sec))
                 _log(f"[runtime] silentcipher_watermark: {stage_sec * 1000.0:.1f} ms")
             else:
-                if self.watermarker.disabled:
-                    msg = (
-                        "info: SilentCipher watermark is disabled by "
-                        "IRODORI_DISABLE_WATERMARK; generated audio was not watermarked."
-                    )
-                else:
-                    msg = (
-                        "warning: SilentCipher watermark is unavailable; generated audio was not "
-                        "watermarked."
-                    )
+                msg = _watermark_unavailable_message(disabled=self.watermarker.disabled)
                 messages.append(msg)
                 _log(msg)
 
