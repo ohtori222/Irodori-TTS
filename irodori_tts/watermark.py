@@ -28,15 +28,16 @@ def _match_original_rank(audio: torch.Tensor, *, reference: torch.Tensor) -> tor
 
 class SilentCipherWatermarker:
     def __init__(self, *, device: str, model_type: str = "44.1k") -> None:
-        self.model = self._load_backend(device=device, model_type=model_type)
+        env_val = os.getenv("IRODORI_DISABLE_WATERMARK", "").strip().lower()
+        self.disabled: bool = env_val in ("1", "true", "yes", "on")
+        if self.disabled:
+            logger.info("SilentCipher watermark is disabled by IRODORI_DISABLE_WATERMARK.")
+            self.model = None
+        else:
+            self.model = self._load_backend(device=device, model_type=model_type)
 
     @staticmethod
     def _load_backend(*, device: str, model_type: str):
-        env_val = os.getenv("IRODORI_DISABLE_WATERMARK", "").strip().lower()
-        if env_val in ("1", "true", "yes", "on"):
-            logger.info("SilentCipher watermark is disabled by IRODORI_DISABLE_WATERMARK.")
-            return None
-
         try:
             import silentcipher
         except ImportError:

@@ -1579,10 +1579,16 @@ class InferenceRuntime:
                 stage_timings.append(("silentcipher_watermark", stage_sec))
                 _log(f"[runtime] silentcipher_watermark: {stage_sec * 1000.0:.1f} ms")
             else:
-                msg = (
-                    "warning: SilentCipher watermark is unavailable; generated audio was not "
-                    "watermarked."
-                )
+                if self.watermarker.disabled:
+                    msg = (
+                        "info: SilentCipher watermark is disabled by "
+                        "IRODORI_DISABLE_WATERMARK; generated audio was not watermarked."
+                    )
+                else:
+                    msg = (
+                        "warning: SilentCipher watermark is unavailable; generated audio was not "
+                        "watermarked."
+                    )
                 messages.append(msg)
                 _log(msg)
 
