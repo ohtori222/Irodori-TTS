@@ -15,6 +15,7 @@ from irodori_tts.inference_runtime import (
     default_runtime_device,
     download_hf_checkpoint,
     get_cached_runtime,
+    lease_cached_runtime,
     list_available_runtime_devices,
     list_available_runtime_precisions,
     save_wav,
@@ -285,71 +286,71 @@ def _run_generation(
     ref_normalize_db = -16.0
     ref_ensure_max = True
 
-    runtime, reloaded = get_cached_runtime(runtime_key)
-    stdout_log(f"[gradio] runtime: {'reloaded' if reloaded else 'reused'}")
-    stdout_log(
-        (
-            "[gradio] request: model_device={} model_precision={} codec_device={} codec_precision={} "
-            "mode={} schedule={} sway_coeff={} seconds={} duration_scale={} steps={} seed={} no_ref={} candidates={}"
-        ).format(
-            model_device,
-            model_precision,
-            codec_device,
-            codec_precision,
-            cfg_guidance_mode,
-            t_schedule_mode,
-            sway_coeff,
-            "auto" if manual_seconds is None else manual_seconds,
-            duration_scale,
-            num_steps,
-            "random" if seed is None else seed,
-            no_ref,
-            requested_candidates,
+    with lease_cached_runtime(runtime_key) as (runtime, reloaded):
+        stdout_log(f"[gradio] runtime: {'reloaded' if reloaded else 'reused'}")
+        stdout_log(
+            (
+                "[gradio] request: model_device={} model_precision={} codec_device={} codec_precision={} "
+                "mode={} schedule={} sway_coeff={} seconds={} duration_scale={} steps={} seed={} no_ref={} candidates={}"
+            ).format(
+                model_device,
+                model_precision,
+                codec_device,
+                codec_precision,
+                cfg_guidance_mode,
+                t_schedule_mode,
+                sway_coeff,
+                "auto" if manual_seconds is None else manual_seconds,
+                duration_scale,
+                num_steps,
+                "random" if seed is None else seed,
+                no_ref,
+                requested_candidates,
+            )
         )
-    )
-    if speaker_embedding is not None:
-        stdout_log(f"[gradio] speaker_embedding: {speaker_embedding}")
-    elif ref_wavs:
-        stdout_log(f"[gradio] reference clips: {len(ref_wavs)}")
+        if speaker_embedding is not None:
+            stdout_log(f"[gradio] speaker_embedding: {speaker_embedding}")
+        elif ref_wavs:
+            stdout_log(f"[gradio] reference clips: {len(ref_wavs)}")
 
-    result = runtime.synthesize(
-        SamplingRequest(
-            text=str(text),
-            ref_wav=None,
-            ref_wavs=ref_wavs or None,
-            ref_latent=None,
-            ref_embed=speaker_embedding,
-            no_ref=bool(no_ref),
-            ref_normalize_db=ref_normalize_db,
-            ref_ensure_max=bool(ref_ensure_max),
-            num_candidates=requested_candidates,
-            decode_mode="sequential",
-            seconds=manual_seconds,
-            duration_scale=float(duration_scale),
-            max_ref_seconds=None,
-            max_text_len=None,
-            num_steps=int(num_steps),
-            seed=None if seed is None else int(seed),
-            cfg_guidance_mode=str(cfg_guidance_mode),
-            cfg_scale_text=float(cfg_scale_text),
-            cfg_scale_speaker=float(cfg_scale_speaker),
-            cfg_scale=cfg_scale,
-            cfg_min_t=float(cfg_min_t),
-            cfg_max_t=float(cfg_max_t),
-            truncation_factor=truncation_factor,
-            rescale_k=rescale_k,
-            rescale_sigma=rescale_sigma,
-            context_kv_cache=bool(context_kv_cache),
-            speaker_kv_scale=speaker_kv_scale,
-            speaker_kv_min_t=speaker_kv_min_t,
-            speaker_kv_max_layers=speaker_kv_max_layers,
-            t_schedule_mode=str(t_schedule_mode),
-            sway_coeff=float(sway_coeff),
-            trim_tail=True,
-            lora_adapter=lora_adapter,
-        ),
-        log_fn=stdout_log,
-    )
+        result = runtime.synthesize(
+            SamplingRequest(
+                text=str(text),
+                ref_wav=None,
+                ref_wavs=ref_wavs or None,
+                ref_latent=None,
+                ref_embed=speaker_embedding,
+                no_ref=bool(no_ref),
+                ref_normalize_db=ref_normalize_db,
+                ref_ensure_max=bool(ref_ensure_max),
+                num_candidates=requested_candidates,
+                decode_mode="sequential",
+                seconds=manual_seconds,
+                duration_scale=float(duration_scale),
+                max_ref_seconds=None,
+                max_text_len=None,
+                num_steps=int(num_steps),
+                seed=None if seed is None else int(seed),
+                cfg_guidance_mode=str(cfg_guidance_mode),
+                cfg_scale_text=float(cfg_scale_text),
+                cfg_scale_speaker=float(cfg_scale_speaker),
+                cfg_scale=cfg_scale,
+                cfg_min_t=float(cfg_min_t),
+                cfg_max_t=float(cfg_max_t),
+                truncation_factor=truncation_factor,
+                rescale_k=rescale_k,
+                rescale_sigma=rescale_sigma,
+                context_kv_cache=bool(context_kv_cache),
+                speaker_kv_scale=speaker_kv_scale,
+                speaker_kv_min_t=speaker_kv_min_t,
+                speaker_kv_max_layers=speaker_kv_max_layers,
+                t_schedule_mode=str(t_schedule_mode),
+                sway_coeff=float(sway_coeff),
+                trim_tail=True,
+                lora_adapter=lora_adapter,
+            ),
+            log_fn=stdout_log,
+        )
 
     out_dir = Path("gradio_outputs")
     out_dir.mkdir(parents=True, exist_ok=True)
