@@ -1,0 +1,65 @@
+name: Workspace Snapshot
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout source revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Prepare source branch ref
+        env:
+          SNAPSHOT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SNAPSHOT_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: git update-ref "refs/heads/$SNAPSHOT_BRANCH" "$SNAPSHOT_SHA"
+
+      - name: Snapshot workspace
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-snapshot
+          path: .
+          include-hidden-files: true
+          retention-days: 1
+
+  merged-workspace:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout merged target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Prepare target branch ref
+        env:
+          SNAPSHOT_SHA: ${{ github.sha }}
+          SNAPSHOT_BRANCH: ${{ github.event.pull_request.base.ref }}
+        run: git update-ref "refs/heads/$SNAPSHOT_BRANCH" "$SNAPSHOT_SHA"
+
+      - name: Snapshot merged workspace
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-snapshot
+          path: .
+          include-hidden-files: true
+          retention-days: 1
