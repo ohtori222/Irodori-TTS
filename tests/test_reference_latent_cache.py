@@ -46,6 +46,7 @@ def _make_runtime(codec: _FakeCodec) -> inference_runtime.InferenceRuntime:
         use_speaker_condition_resolved=True,
     )
     runtime.codec = codec
+    runtime._codec_lock = threading.Lock()
     runtime.default_max_ref_seconds = 30.0
     return runtime
 

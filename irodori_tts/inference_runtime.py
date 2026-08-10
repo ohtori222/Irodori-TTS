@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -112,6 +112,14 @@ def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
     if resolved.type in ("cuda", "xpu"):
         return ["fp32", "fp16", "bf16"]
     return ["fp32"]
+
+
+def _should_pipeline_cpu_codec(
+    model_device: torch.device,
+    codec_device: torch.device,
+) -> bool:
+    """Return whether CPU codec work can overlap the non-CPU model stage."""
+    return codec_device.type == "cpu" and model_device.type != "cpu"
 
 
 def _sync_device(device: torch.device) -> None:
@@ -710,8 +718,25 @@ class InferenceRuntime:
         self.default_max_ref_seconds = float(default_max_ref_seconds)
         self.watermarker = SilentCipherWatermarker(device=str(self.codec_device))
         self._infer_lock = threading.Lock()
+        self._codec_lock = threading.Lock()
+        self._request_lease_lock = threading.Lock()
+        self._active_requests = 0
         self._model_dtype = next(self.model.parameters()).dtype
         self._lora_adapter_names: dict[str, str] = {}
+
+    def _acquire_request_lease(self) -> None:
+        with self._request_lease_lock:
+            self._active_requests += 1
+
+    def _release_request_lease(self) -> None:
+        with self._request_lease_lock:
+            if self._active_requests <= 0:
+                raise RuntimeError("runtime request lease underflow")
+            self._active_requests -= 1
+
+    def has_active_requests(self) -> bool:
+        with self._request_lease_lock:
+            return self._active_requests > 0
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -1083,12 +1108,13 @@ class InferenceRuntime:
                                     f"{float(max_ref_samples) / float(sr):.2f}s."
                                 )
                                 wav = wav[:, :max_ref_samples]
-                        encoded = self.codec.encode_waveform(
-                            wav.unsqueeze(0),
-                            sample_rate=int(sr),
-                            normalize_db=req.ref_normalize_db,
-                            ensure_max=bool(req.ref_ensure_max),
-                        )
+                        with self._codec_lock:
+                            encoded = self.codec.encode_waveform(
+                                wav.unsqueeze(0),
+                                sample_rate=int(sr),
+                                normalize_db=req.ref_normalize_db,
+                                ensure_max=bool(req.ref_ensure_max),
+                            )
                         piece = _validate_reference_latent(
                             encoded,
                             latent_dim=int(self.model_cfg.latent_dim),
@@ -1181,6 +1207,77 @@ class InferenceRuntime:
             f"tokens={state.shape[1]} uncond_mode={req.speaker_uncond_mode}."
         )
         return state, mask
+
+    def _decode_and_postprocess(
+        self,
+        *,
+        z: torch.Tensor,
+        req: SamplingRequest,
+        num_candidates: int,
+        target_samples: int,
+        decode_mode: str,
+        messages: list[str],
+        stage_timings: list[tuple[str, float]],
+        log_fn: Callable[[str], None],
+    ) -> list[torch.Tensor]:
+        """Decode generated latents while serializing access to the shared codec."""
+        with self._codec_lock, torch.inference_mode():
+            t0 = _measure_start(self.codec_device)
+            trimmed_audios: list[torch.Tensor] = []
+            if decode_mode == "batch":
+                audio_batch = self.codec.decode_latent(z).cpu()
+                for i in range(num_candidates):
+                    audio_i = audio_batch[i]
+                    max_samples = target_samples
+                    if bool(req.trim_tail):
+                        flattening_point = find_flattening_point(
+                            z[i],
+                            window_size=max(1, int(req.tail_window_size)),
+                            std_threshold=float(req.tail_std_threshold),
+                            mean_threshold=float(req.tail_mean_threshold),
+                        )
+                        flattening_samples = int(
+                            flattening_point * int(self.codec.model.hop_length)
+                        )
+                        if flattening_samples > 0:
+                            max_samples = min(max_samples, flattening_samples)
+                    trimmed_audios.append(audio_i[:, :max_samples])
+            else:
+                for i in range(num_candidates):
+                    audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
+                    max_samples = target_samples
+                    if bool(req.trim_tail):
+                        flattening_point = find_flattening_point(
+                            z[i],
+                            window_size=max(1, int(req.tail_window_size)),
+                            std_threshold=float(req.tail_std_threshold),
+                            mean_threshold=float(req.tail_mean_threshold),
+                        )
+                        flattening_samples = int(
+                            flattening_point * int(self.codec.model.hop_length)
+                        )
+                        if flattening_samples > 0:
+                            max_samples = min(max_samples, flattening_samples)
+                    trimmed_audios.append(audio_i[:, :max_samples])
+            stage_sec = _measure_end(self.codec_device, t0)
+            stage_timings.append(("decode_latent", stage_sec))
+            log_fn(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
+
+            if self.watermarker.ready:
+                t0 = _measure_start(self.codec_device)
+                trimmed_audios = self.watermarker.encode_batch(
+                    trimmed_audios,
+                    sample_rate=int(self.codec.sample_rate),
+                )
+                stage_sec = _measure_end(self.codec_device, t0)
+                stage_timings.append(("silentcipher_watermark", stage_sec))
+                log_fn(f"[runtime] silentcipher_watermark: {stage_sec * 1000.0:.1f} ms")
+            else:
+                msg = _watermark_unavailable_message(disabled=self.watermarker.disabled)
+                messages.append(msg)
+                log_fn(msg)
+
+        return trimmed_audios
 
     def synthesize(
         self,
@@ -1329,18 +1426,30 @@ class InferenceRuntime:
         else:
             used_seed = int(req.seed)
             _log(f"[runtime] using seed: {used_seed}")
-        post_load_t0 = _measure_start(self.model_device, self.codec_device)
+        post_load_t0 = time.perf_counter()
+        pipeline_cpu_codec = _should_pipeline_cpu_codec(
+            self.model_device,
+            self.codec_device,
+        )
+        if pipeline_cpu_codec:
+            msg = (
+                "info: CPU codec pipeline enabled; model inference lock will be released "
+                "before codec decode."
+            )
+            messages.append(msg)
+            _log(msg)
 
-        with (
-            self._infer_lock,
-            self._prepare_lora_for_request(
-                req.lora_adapter,
-                messages=messages,
-                stage_timings=stage_timings,
-                log_fn=_log,
-            ),
-            torch.inference_mode(),
-        ):
+        with ExitStack() as infer_stack:
+            infer_stack.enter_context(self._infer_lock)
+            infer_stack.enter_context(
+                self._prepare_lora_for_request(
+                    req.lora_adapter,
+                    messages=messages,
+                    stage_timings=stage_timings,
+                    log_fn=_log,
+                )
+            )
+            infer_stack.enter_context(torch.inference_mode())
             t0 = _measure_start(self.model_device)
             text_ids, text_mask = self.tokenizer.batch_encode(
                 [normalized_text] * num_candidates,
@@ -1540,62 +1649,27 @@ class InferenceRuntime:
             _log(f"[runtime] unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
             z = z[:, :latent_steps]
 
-            t0 = _measure_start(self.model_device, self.codec_device)
-            trimmed_audios: list[torch.Tensor] = []
-            if decode_mode == "batch":
-                audio_batch = self.codec.decode_latent(z).cpu()
-                for i in range(num_candidates):
-                    audio_i = audio_batch[i]
-                    max_samples = target_samples
-                    if bool(req.trim_tail):
-                        flattening_point = find_flattening_point(
-                            z[i],
-                            window_size=max(1, int(req.tail_window_size)),
-                            std_threshold=float(req.tail_std_threshold),
-                            mean_threshold=float(req.tail_mean_threshold),
-                        )
-                        flattening_samples = int(
-                            flattening_point * int(self.codec.model.hop_length)
-                        )
-                        if flattening_samples > 0:
-                            max_samples = min(max_samples, flattening_samples)
-                    trimmed_audios.append(audio_i[:, :max_samples])
-            else:
-                for i in range(num_candidates):
-                    audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
-                    max_samples = target_samples
-                    if bool(req.trim_tail):
-                        flattening_point = find_flattening_point(
-                            z[i],
-                            window_size=max(1, int(req.tail_window_size)),
-                            std_threshold=float(req.tail_std_threshold),
-                            mean_threshold=float(req.tail_mean_threshold),
-                        )
-                        flattening_samples = int(
-                            flattening_point * int(self.codec.model.hop_length)
-                        )
-                        if flattening_samples > 0:
-                            max_samples = min(max_samples, flattening_samples)
-                    trimmed_audios.append(audio_i[:, :max_samples])
-            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
-            stage_timings.append(("decode_latent", stage_sec))
-            _log(f"[runtime] decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
+            if pipeline_cpu_codec:
+                t0 = _measure_start(self.model_device)
+                z = z.to(device=self.codec_device, dtype=self.codec.dtype)
+                stage_sec = _measure_end(self.model_device, t0)
+                stage_timings.append(("handoff_latent_to_codec", stage_sec))
+                _log(f"[runtime] handoff_latent_to_codec: {stage_sec * 1000.0:.1f} ms")
+                # Exit inference_mode and the LoRA context before another request may
+                # acquire the model lock. This keeps shared model state serialized.
+                infer_stack.close()
 
-            if self.watermarker.ready:
-                t0 = _measure_start(self.codec_device)
-                trimmed_audios = self.watermarker.encode_batch(
-                    trimmed_audios,
-                    sample_rate=int(self.codec.sample_rate),
-                )
-                stage_sec = _measure_end(self.codec_device, t0)
-                stage_timings.append(("silentcipher_watermark", stage_sec))
-                _log(f"[runtime] silentcipher_watermark: {stage_sec * 1000.0:.1f} ms")
-            else:
-                msg = _watermark_unavailable_message(disabled=self.watermarker.disabled)
-                messages.append(msg)
-                _log(msg)
-
-            total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
+            trimmed_audios = self._decode_and_postprocess(
+                z=z,
+                req=req,
+                num_candidates=num_candidates,
+                target_samples=target_samples,
+                decode_mode=decode_mode,
+                messages=messages,
+                stage_timings=stage_timings,
+                log_fn=_log,
+            )
+            total_to_decode = time.perf_counter() - post_load_t0
             _log(f"[runtime] total_to_decode: {total_to_decode:.3f} s")
 
         _log("[runtime] done synthesize")
@@ -1632,6 +1706,13 @@ _RUNTIME_CACHE_KEY: RuntimeKey | None = None
 _RUNTIME_CACHE_VALUE: InferenceRuntime | None = None
 
 
+def _ensure_runtime_replaceable(runtime: InferenceRuntime | None) -> None:
+    if runtime is not None and runtime.has_active_requests():
+        raise RuntimeError(
+            "Cannot replace or unload the cached runtime while synthesis requests are active."
+        )
+
+
 def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
     global _RUNTIME_CACHE_KEY, _RUNTIME_CACHE_VALUE
     with _RUNTIME_CACHE_LOCK:
@@ -1639,6 +1720,7 @@ def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
             return _RUNTIME_CACHE_VALUE, False
 
         old_runtime = _RUNTIME_CACHE_VALUE
+        _ensure_runtime_replaceable(old_runtime)
         runtime = InferenceRuntime.from_key(key)
         _RUNTIME_CACHE_KEY = key
         _RUNTIME_CACHE_VALUE = runtime
@@ -1649,10 +1731,38 @@ def get_cached_runtime(key: RuntimeKey) -> tuple[InferenceRuntime, bool]:
     return runtime, True
 
 
+@contextmanager
+def lease_cached_runtime(key: RuntimeKey):
+    """Lease the cached runtime so concurrent requests cannot unload it."""
+    global _RUNTIME_CACHE_KEY, _RUNTIME_CACHE_VALUE
+    old_runtime: InferenceRuntime | None = None
+    with _RUNTIME_CACHE_LOCK:
+        if _RUNTIME_CACHE_VALUE is not None and _RUNTIME_CACHE_KEY == key:
+            runtime = _RUNTIME_CACHE_VALUE
+            reloaded = False
+        else:
+            old_runtime = _RUNTIME_CACHE_VALUE
+            _ensure_runtime_replaceable(old_runtime)
+            runtime = InferenceRuntime.from_key(key)
+            _RUNTIME_CACHE_KEY = key
+            _RUNTIME_CACHE_VALUE = runtime
+            reloaded = True
+        runtime._acquire_request_lease()
+
+    if old_runtime is not None:
+        old_runtime.unload()
+
+    try:
+        yield runtime, reloaded
+    finally:
+        runtime._release_request_lease()
+
+
 def clear_cached_runtime() -> None:
     global _RUNTIME_CACHE_KEY, _RUNTIME_CACHE_VALUE
     with _RUNTIME_CACHE_LOCK:
         runtime = _RUNTIME_CACHE_VALUE
+        _ensure_runtime_replaceable(runtime)
         _RUNTIME_CACHE_KEY = None
         _RUNTIME_CACHE_VALUE = None
 

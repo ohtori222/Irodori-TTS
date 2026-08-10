@@ -15,6 +15,7 @@ from irodori_tts.inference_runtime import (
     default_runtime_device,
     download_hf_checkpoint,
     get_cached_runtime,
+    lease_cached_runtime,
     list_available_runtime_devices,
     list_available_runtime_precisions,
     save_wav,
@@ -288,87 +289,87 @@ def _run_generation(
     manual_seconds = _parse_optional_float(seconds_raw, "seconds")
     lora_adapter = _parse_optional_str(lora_adapter_raw)
 
-    runtime, reloaded = get_cached_runtime(runtime_key)
-    if not runtime.model_cfg.use_caption_condition:
-        raise ValueError(
-            "Loaded checkpoint does not enable caption conditioning. "
-            "Use gradio_app.py for reference-only inference."
-        )
-    ref_wav_paths = _resolve_ref_wavs(ref_wavs)
-    effective_no_ref = not ref_wav_paths or not runtime.model_cfg.use_speaker_condition_resolved
-    if effective_no_ref:
-        ref_wav_paths = []
+    with lease_cached_runtime(runtime_key) as (runtime, reloaded):
+        if not runtime.model_cfg.use_caption_condition:
+            raise ValueError(
+                "Loaded checkpoint does not enable caption conditioning. "
+                "Use gradio_app.py for reference-only inference."
+            )
+        ref_wav_paths = _resolve_ref_wavs(ref_wavs)
+        effective_no_ref = not ref_wav_paths or not runtime.model_cfg.use_speaker_condition_resolved
+        if effective_no_ref:
+            ref_wav_paths = []
 
-    stdout_log(f"[gradio-caption] runtime: {'reloaded' if reloaded else 'reused'}")
-    stdout_log(
-        (
-            "[gradio-caption] request: model_device={} model_precision={} codec_device={} codec_precision={} "
-            "mode={} schedule={} sway_coeff={} seconds={} duration_scale={} steps={} seed={} candidates={}"
-        ).format(
-            model_device,
-            model_precision,
-            codec_device,
-            codec_precision,
-            cfg_guidance_mode,
-            t_schedule_mode,
-            sway_coeff,
-            "auto" if manual_seconds is None else manual_seconds,
-            duration_scale,
-            num_steps,
-            "random" if seed is None else seed,
-            requested_candidates,
+        stdout_log(f"[gradio-caption] runtime: {'reloaded' if reloaded else 'reused'}")
+        stdout_log(
+            (
+                "[gradio-caption] request: model_device={} model_precision={} codec_device={} codec_precision={} "
+                "mode={} schedule={} sway_coeff={} seconds={} duration_scale={} steps={} seed={} candidates={}"
+            ).format(
+                model_device,
+                model_precision,
+                codec_device,
+                codec_precision,
+                cfg_guidance_mode,
+                t_schedule_mode,
+                sway_coeff,
+                "auto" if manual_seconds is None else manual_seconds,
+                duration_scale,
+                num_steps,
+                "random" if seed is None else seed,
+                requested_candidates,
+            )
         )
-    )
-    if ref_wav_paths:
-        stdout_log(f"[gradio-caption] reference clips: {len(ref_wav_paths)}")
-    stdout_log(
-        "[gradio-caption] conditioning: text={} caption={} speaker={}".format(
-            "on" if text_value else "off",
-            "on" if caption_value else "off (text-only)",
-            "off (no-ref)" if effective_no_ref else "on",
+        if ref_wav_paths:
+            stdout_log(f"[gradio-caption] reference clips: {len(ref_wav_paths)}")
+        stdout_log(
+            "[gradio-caption] conditioning: text={} caption={} speaker={}".format(
+                "on" if text_value else "off",
+                "on" if caption_value else "off (text-only)",
+                "off (no-ref)" if effective_no_ref else "on",
+            )
         )
-    )
 
-    result = runtime.synthesize(
-        SamplingRequest(
-            text=text_value,
-            caption=caption_value or None,
-            ref_wav=None,
-            ref_wavs=ref_wav_paths or None,
-            ref_latent=None,
-            no_ref=effective_no_ref,
-            ref_normalize_db=-16.0,
-            ref_ensure_max=True,
-            num_candidates=requested_candidates,
-            decode_mode="sequential",
-            seconds=manual_seconds,
-            duration_scale=float(duration_scale),
-            max_ref_seconds=None,
-            max_text_len=max_text_len,
-            max_caption_len=max_caption_len,
-            num_steps=int(num_steps),
-            seed=None if seed is None else int(seed),
-            cfg_guidance_mode=str(cfg_guidance_mode),
-            cfg_scale_text=float(cfg_scale_text),
-            cfg_scale_caption=float(cfg_scale_caption),
-            cfg_scale_speaker=0.0 if effective_no_ref else float(cfg_scale_speaker),
-            cfg_scale=cfg_scale,
-            cfg_min_t=float(cfg_min_t),
-            cfg_max_t=float(cfg_max_t),
-            truncation_factor=truncation_factor,
-            rescale_k=rescale_k,
-            rescale_sigma=rescale_sigma,
-            context_kv_cache=bool(context_kv_cache),
-            speaker_kv_scale=None if effective_no_ref else speaker_kv_scale,
-            speaker_kv_min_t=None,
-            speaker_kv_max_layers=None,
-            t_schedule_mode=str(t_schedule_mode),
-            sway_coeff=float(sway_coeff),
-            trim_tail=True,
-            lora_adapter=lora_adapter,
-        ),
-        log_fn=stdout_log,
-    )
+        result = runtime.synthesize(
+            SamplingRequest(
+                text=text_value,
+                caption=caption_value or None,
+                ref_wav=None,
+                ref_wavs=ref_wav_paths or None,
+                ref_latent=None,
+                no_ref=effective_no_ref,
+                ref_normalize_db=-16.0,
+                ref_ensure_max=True,
+                num_candidates=requested_candidates,
+                decode_mode="sequential",
+                seconds=manual_seconds,
+                duration_scale=float(duration_scale),
+                max_ref_seconds=None,
+                max_text_len=max_text_len,
+                max_caption_len=max_caption_len,
+                num_steps=int(num_steps),
+                seed=None if seed is None else int(seed),
+                cfg_guidance_mode=str(cfg_guidance_mode),
+                cfg_scale_text=float(cfg_scale_text),
+                cfg_scale_caption=float(cfg_scale_caption),
+                cfg_scale_speaker=0.0 if effective_no_ref else float(cfg_scale_speaker),
+                cfg_scale=cfg_scale,
+                cfg_min_t=float(cfg_min_t),
+                cfg_max_t=float(cfg_max_t),
+                truncation_factor=truncation_factor,
+                rescale_k=rescale_k,
+                rescale_sigma=rescale_sigma,
+                context_kv_cache=bool(context_kv_cache),
+                speaker_kv_scale=None if effective_no_ref else speaker_kv_scale,
+                speaker_kv_min_t=None,
+                speaker_kv_max_layers=None,
+                t_schedule_mode=str(t_schedule_mode),
+                sway_coeff=float(sway_coeff),
+                trim_tail=True,
+                lora_adapter=lora_adapter,
+            ),
+            log_fn=stdout_log,
+        )
 
     out_dir = Path("gradio_outputs_voicedesign")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -626,6 +627,8 @@ def build_ui() -> gr.Blocks:
                 lora_adapter_raw,
             ],
             outputs=[*out_audios, out_log, out_timing],
+            concurrency_limit=2,
+            concurrency_id="irodori-generation",
         )
         model_device.change(
             _on_model_device_change, inputs=[model_device], outputs=[model_precision]
